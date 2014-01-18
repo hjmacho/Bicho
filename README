@@ -85,7 +85,7 @@ $ bicho --db-user-out=[DB USER] --db-password-out=[DB PASS] --db-database-out=[D
 
 E3. Getting information from a project using JIRA
 
-$ bicho --db-user-out=[DB USER] --db-password-out=[DB PASS] --db-database-out=[DB NAME] -d 15 -b jira -u "http://support.petalslink.com/browse/PETALSMASTER"
+$ bicho --db-user-out=[DB USER] --db-password-out=[DB PASS] --db-database-out=[DB NAME] -d 15 -b atljira -u "http://support.petalslink.com/browse/PETALSMASTER"
 
 E4. Getting information from a project using Launchpad
 

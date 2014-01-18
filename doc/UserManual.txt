@@ -56,7 +56,7 @@ Bicho needs some libraries, such as:
 3.- Installation:
 		---------------
 
-Bicho depends on several other packages, including Storm, Beautiful Soup, dateutil, and (if you are working with a Launchpad bugtracker) launchpadlib. Details for a few of those requirements are below.
+Bicho depends on several other packages, including Storm, Beautiful Soup, dateutil, launchpadlib (if you are working with a Launchpad bugtracker) and jira-python (if you are working with a Jira bugtracker). Details for a few of those requirements are below.
 
 Installing Requirements: Storm
 
@@ -133,6 +133,24 @@ Start up a Python interpreter by typing "python" or "ipython" at a terminal.
 If you do not get a message telling you that BeautifulSoup does not exist, then the
 library was installed succesfully.
 
+
+Installing Requirements: jira-python
+
+
+Step 1: 
+
+You can download, unpack, and install jira-python in one step with
+
+$ pip install jira-python
+
+Step 2: Test it
+
+Start up a Python interpreter by typing "python" or "ipython" at a terminal. 
+
+> from jira.client import JIRA
+
+If you do not get a message telling you that jira does not exist, the
+library was installed succesfully.
 
 
 Installing Bicho:
