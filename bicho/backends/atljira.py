@@ -34,13 +34,8 @@ from bicho.backends import Backend
 from bicho.db.database import DBIssue, DBBackend, DBTracker, get_database
 from bicho.config import Config
 from bicho.utils import printout, printerr, printdbg
-from BeautifulSoup import BeautifulSoup, Tag, NavigableString
-#from BeautifulSoup import NavigableString
-from BeautifulSoup import Comment as BFComment
 
-
-import xml.sax.handler
-#from xml.sax._exceptions import SAXParseException
+from jira.client import JIRA
 
 import feedparser
 
@@ -328,96 +323,7 @@ class Bug():
         self.customfields = []
 
 
-class SoupHtmlParser():
-
-    def __init__(self, html, idBug):
-        self.html = html
-        self.idBug = idBug
-        self.changes_lost = 0
-
-    def remove_comments(self, soup):
-        cmts = soup.findAll(text=lambda text: isinstance(text, BFComment))
-        # Rip <!--HTML comments--> out of the tree so they don't take up memory
-        [comment.extract() for comment in cmts]
-
-    def _get_identifier(self, td_html):
-        # gets TD HTML Beautiful object and return id or email
-        #
-        # Example: <td width="40%" class="activity-old-val"> SE Support <span class="hist-value">[ <a href="mailto:support-lep@liferay.com">support-lep@liferay.com</a> ]</span></td>
-        # Example: <td width="40%" class="activity-new-val"> Ryan Park <span class="hist-value">[    ryan.park ]</span> </td>
-        myaux = td_html.find('span')
-        if myaux:
-            if myaux.find('a'):
-                identifier = myaux.find('a').contents[0]
-            else:
-                aux = myaux.text
-                identifier = aux.replace('[', '').replace(']', '').strip()
-            return identifier
-        else:
-            return ''
-
-    def parse_changes(self):
-        soup = BeautifulSoup(self.html)
-        self.remove_comments(soup)
-        remove_tags = ['i']
-        try:
-            [i.replaceWith(i.contents[0]) for i in soup.findAll(remove_tags)]
-        except Exception:
-            None
-
-        changes = []
-        #FIXME The id of the changes are not stored
-        tables = soup.findAll("div", {"class": "actionContainer"})
-
-        for table in tables:
-            author_date_text = table.find("div", {"class": "action-details"})
-
-            if author_date_text is None:
-                # no changes have been performed on the issue
-                continue
-            elif len(author_date_text) < 3:
-                self.changes_lost += 1
-                printerr("Change author format not supported. Change lost!")
-                continue
-
-            a_link = table.find("a", {"class": "user-hover user-avatar"})
-
-            if a_link:
-                # at this point a_link will be similar to the lines below:
-                #<a class="user-hover user-avatar" rel="kiyoshi.lee"
-                author_url = a_link['rel']
-                author = People(author_url)
-            else:
-                # instead of <a .. we got a <span ..
-                span_link = table.find("span", {"class": "user-hover user-avatar"})
-                author_url = span_link['rel']
-                author = People(author_url)
-
-
-            # we look for a string similar to:
-            #<time datetime="2011-11-19T00:27-0800">19/Nov/11 12:27 AM</time>
-
-            raw_date = author_date_text.find('time')['datetime']
-            date = parse(raw_date).replace(tzinfo=None)
-
-            rows = list(table.findAll('tr'))
-            for row in rows:
-                cols = list(row.findAll('td'))
-                if len(cols) == 3:
-                    field = unicode(cols[0].contents[0].strip())
-                    if field == "Assignee":
-                        old = unicode(self._get_identifier(cols[1]))
-                        new = unicode(self._get_identifier(cols[2]))
-                    else:
-                        old = unicode(cols[1].contents[0].strip())
-                        new = unicode(cols[2].contents[0].strip())
-
-                    change = Change(field, old, new, author, date)
-                    changes.append(change)
-        return changes
-
-
-class BugsHandler(xml.sax.handler.ContentHandler):
+class BugsHandler():
 
     def __init__(self):
         self.issues_data = []
@@ -723,91 +629,99 @@ class BugsHandler(xml.sax.handler.ContentHandler):
             str = str[2:len(str) - 1]
         return str
 
-    @staticmethod
-    def getUserEmail(username):
-        return ""
-        # http://issues.liferay.com/activity?maxResults=1&streams=user+IS+kalman.vincze
-        if not "_emails" in vars(BugsHandler):
-            BugsHandler._emails = {}
-        if username in BugsHandler._emails:
-            email = BugsHandler._emails[username]
-        else:
-            serverUrl = Config.url.split("/browse/")[0]
-            user_url = serverUrl + "/activity?maxResults=1&streams=user+IS+" + username
-            email = ""
-            d = feedparser.parse(user_url)
-            if 'entries' in d:
-                if len(d['entries']) > 0:
-                    email = d['entries'][0]['author_detail']['email']
-                    email = BugsHandler.remove_unicode(email)
-                    printdbg(username + " " + email)
-            BugsHandler._emails[username] = email
-        return email
+    def obtainDataPerson(self, obj):
+        person = People(obj.name)
+        if hasattr(obj, 'displayName'):
+            person.set_name(obj.displayName)
+        if hasattr(obj, 'emailAddress'):
+            person.set_email(obj.emailAddress)
+        return person
 
-    def getIssues(self):
+    def createPerson(self, obj, attr):
+        person = People(None)
+        if (attr == 'assignee'):
+            if (hasattr(obj, 'assignee') and (obj.assignee != None)):
+                person = self.obtainDataPerson(obj.assignee)
+        elif (attr == 'reporter'):
+            if (hasattr(obj, 'reporter') and (obj.reporter != None)):
+                person = self.obtainDataPerson(obj.reporter)
+        elif ((attr == 'changeAuthor') or (attr == 'commentAuthor') or (attr == 'attachmentAuthor')):
+            if (hasattr(obj, 'author') and (obj.author != None)):
+                person = self.obtainDataPerson(obj.author)
+        return person
+
+
+    def concatenateItems(self, items):
+        itemsResult = (items.pop(0)).name
+        for item in items:
+            itemsResult += ', ' + item.name
+        return itemsResult
+        
+
+    def getIssues(self, issues, url):
         bicho_bugs = []
-        for bug in self.issues_data:
-            bicho_bugs.append(self.getIssue(bug))
+        for bug in issues:
+            bicho_bugs.append(self.getIssue(bug, url))
         return bicho_bugs
 
-    def getIssue(self, bug):
-        #Return the parse data bug into issue object
-        issue_id = bug.key_id
-        issue_type = bug.bug_type
-        summary = bug.summary
-        description = bug.description
-        status = bug.status
-        resolution = bug.resolution
+    def getIssue(self, bug, url):
+        #Return the data bug from JIRA REST API into issue object
+        issue_id = bug.id
+        issue_type = bug.fields.issuetype
+        summary = bug.fields.summary
+        description = bug.fields.description
+        status = bug.fields.status.name
+        resolution = bug.fields.resolution
 
-        assigned_by = People(bug.assignee_username)
-        assigned_by.set_name(bug.assignee)
-        assigned_by.set_email(BugsHandler.getUserEmail(bug.assignee_username))
+        assigned_by = self.createPerson(bug.fields, 'assignee')
 
-        submitted_by = People(bug.reporter_username)
-        submitted_by.set_name(bug.reporter)
-        submitted_by.set_email(BugsHandler.getUserEmail(bug.reporter_username))
-
-        submitted_on = parse(bug.created).replace(tzinfo=None)
+        submitted_by = self.createPerson(bug.fields, 'reporter')
+        submitted_on = parse(bug.fields.created).replace(tzinfo=None)
 
         issue = JiraIssue(issue_id, issue_type, summary, description, submitted_by, submitted_on)
         issue.set_assigned(assigned_by)
-        issue.setIssue_key(bug.issue_key)
-        issue.setTitle(bug.title)
-        issue.setLink(bug.link)
-        issue.setEnvironment(bug.environment)
-        issue.setSecurity(bug.security)
-        issue.setUpdated(parse(bug.updated).replace(tzinfo=None))
-        issue.setVersion(bug.version)
-        issue.setComponent(bug.component)
-        issue.setVotes(bug.votes)
-        issue.setProject(bug.project)
-        issue.setProject_id(bug.project_id)
-        issue.setProject_key(bug.project_key)
+        issue.setIssue_key(bug.key)
+        issue.setTitle("[" + bug.key + "] " + summary)
+        issue.setLink(url+bug.key)
+        issue.setEnvironment(bug.fields.environment)
+        issue.setSecurity("")
+        issue.setUpdated(parse(bug.fields.updated).replace(tzinfo=None))
+        if (bug.fields.versions):
+            issue.setVersion(self.concatenateItems(bug.fields.versions))
+        if (bug.fields.components):
+            issue.setComponent(self.concatenateItems(bug.fields.components))
+        issue.setVotes(bug.fields.votes.votes)
+        issue.setProject(bug.fields.project.name)
+        issue.setProject_id(bug.fields.project.id)
+        issue.setProject_key(bug.fields.project.key)
         issue.setStatus(status)
         issue.setResolution(resolution)
 
-        bug_activity_url = bug.link + '?page=com.atlassian.jira.plugin.system.issuetabpanels%3Achangehistory-tabpanel'
-        printdbg("Bug activity: " + bug_activity_url)
-        data_activity = urllib.urlopen(bug_activity_url).read()
-        parser = SoupHtmlParser(data_activity, bug.key_id)
-        changes = parser.parse_changes()
-        for c in changes:
-            issue.add_change(c)
+        if hasattr(bug, 'changelog'):
+            for history in bug.changelog.histories:
+                for item in history.items:
+                    field = item.field
+                    old = item.fromString
+                    new = item.toString
+                    author = self.createPerson(history,'changeAuthor')
+                    date = parse(history.created).replace(tzinfo=None)
+                    change = Change(field, old, new, author, date)
+                    issue.add_change(change) 
 
-        for comment in bug.comments:
-            comment_by = People(comment.comment_author)
-            comment_by.set_email(BugsHandler.getUserEmail(comment.comment_author))
-            comment_on = parse(comment.comment_created).replace(tzinfo=None)
-            com = Comment(comment.comment, comment_by, comment_on)
-            issue.add_comment(com)
+        if hasattr(bug.fields, 'comment'):
+            for comment in bug.fields.comment.comments:
+                comment_by = self.createPerson(comment, 'commentAuthor')
+                comment_on = parse(comment.created).replace(tzinfo=None)
+                com = Comment(comment.body, comment_by, comment_on)
+                issue.add_comment(com)
 
-        for attachment in bug.attachments:
-            url = "/secure/attachment/" + attachment.attachment_id + "/" + attachment.attachment_name
-            attachment_by = People(attachment.attachment_author)
-            attachment_by.set_email(BugsHandler.getUserEmail(attachment.attachment_author))
-            attachment_on = parse(attachment.attachment_created).replace(tzinfo=None)
-            attach = Attachment(url, attachment_by, attachment_on)
-            issue.add_attachment(attach)
+        if hasattr(bug.fields, 'attachment'):
+            for attachment in bug.fields.attachment:
+                url = attachment.content
+                attachment_by = self.createPerson(attachment, 'attachmentAuthor')
+                attachment_on = parse(attachment.created).replace(tzinfo=None)
+                attach = Attachment(url, attachment_by, attachment_on)
+                issue.add_attachment(attach)
         #FIXME customfield are not stored in db because is the fields has the same in all the bugs
 
         return issue
@@ -815,12 +729,14 @@ class BugsHandler(xml.sax.handler.ContentHandler):
 
 class JiraBackend(Backend):
     """
-    Jira Backend
-    """
+Jira Backend
+"""
 
     def __init__(self):
         self.delay = Config.delay
         self.url = Config.url
+        self.serverUrl = Config.url.split("/browse/")[0]
+        self.projectName = Config.url.split("/browse/")[1]
 
     def basic_jira_url(self):
         serverUrl = self.url.split("/browse/")[0]
@@ -832,58 +748,27 @@ class JiraBackend(Backend):
             url_issues += "&updated:after=" + self.last_mod_date
         return url_issues
 
-    def bugsNumber(self, url):
-        oneBug = self.basic_jira_url()
-        oneBug += "&tempMax=1"
-        printdbg("Getting number of issues: " + oneBug)
-        data_url = urllib.urlopen(oneBug).read()
-        bugs = data_url.split("<issue")[1].split('\"/>')[0].split("total=\"")[1]
+
+    def bugsNumber(self, jira):
+        printdbg("Getting number of issues: " + self.url)
+        issue = jira.search_issues('project=' + self.projectName,startAt=0,maxResults=1)
+        bugs = issue.total
         return int(bugs)
 
     # http://stackoverflow.com/questions/8733233/filtering-out-certain-bytes-in-python
     def valid_XML_char_ordinal(self, i):
-        return (  # conditions ordered by presumed frequency
+        return ( # conditions ordered by presumed frequency
             0x20 <= i <= 0xD7FF
             or i in (0x9, 0xA, 0xD)
             or 0xE000 <= i <= 0xFFFD
             or 0x10000 <= i <= 0x10FFFF)
 
-    def safe_xml_parse(self, url_issues, handler):
-        f = urllib.urlopen(url_issues)
-        parser = xml.sax.make_parser()
-        parser.setContentHandler(handler)
-
-        try:
-            contents = f.read()
-            parser.feed(contents)
-            parser.close()
-        except Exception:
-            # Clean only the invalid XML
-            try:
-                parser2 = xml.sax.make_parser()
-                parser2.setContentHandler(handler)
-                parser2.setContentHandler(handler)
-                printdbg("Cleaning dirty XML")
-                cleaned_contents = ''. \
-                    join(c for c in contents if self.valid_XML_char_ordinal(ord(c)))
-                parser2.feed(cleaned_contents)
-                parser2.close()
-            except Exception:
-                printerr("Error parsing URL: %s" % (url_issues))
-                raise
-        f.close()
-
-    def analyze_bug_list(self, nissues, offset, bugsdb, dbtrk_id):
-        url_issues = self.basic_jira_url()
-        url_issues += "&tempMax=" + str(nissues) + "&pager/start=" + str(offset)
-        printdbg(url_issues)
-
+    def analyze_bug_list(self, issues, url, bugsdb, dbtrk_id):
         handler = BugsHandler()
-        self.safe_xml_parse(url_issues, handler)
 
         try:
-            issues = handler.getIssues()
-            for issue in issues:
+            issuesDB = handler.getIssues(issues, url)
+            for issue in issuesDB:
                 bugsdb.insert_issue(issue, dbtrk_id)
         except Exception, e:
             import traceback
@@ -893,7 +778,8 @@ class JiraBackend(Backend):
     def run(self):
         printout("Running Bicho with delay of %s seconds" % (str(self.delay)))
 
-        issues_per_xml_query = 500
+        issues_per_query = 100
+        
         bugsdb = get_database(DBJiraBackend())
 
         bugsdb.insert_supported_traker("jira", "4.1.2")
@@ -904,20 +790,20 @@ class JiraBackend(Backend):
         query = "/si/jira.issueviews:issue-xml/"
         project = self.url.split("/browse/")[1]
 
+        options_jira = {
+            'server': self.serverUrl
+        }
+        
+        jira = JIRA(options_jira)
+
         if (project.split("-").__len__() > 1):
             bug_key = project
             project = project.split("-")[0]
-            bugs_number = 1
+            bugs_number = self.bugsNumber(jira)
 
-            printdbg(serverUrl + query + bug_key + "/" + bug_key + ".xml")
-
-            parser = xml.sax.make_parser()
-            handler = BugsHandler()
-            parser.setContentHandler(handler)
             try:
-                parser.parse(serverUrl + query + bug_key + "/" + bug_key + ".xml")
-                issue = handler.getIssues()[0]
-                bugsdb.insert_issue(issue, dbtrk.id)
+                issue = jira.issue(bug_key,expand='changelog')
+                self.analyze_bug_list(issue, self.serverUrl+'/browse/', bugsdb, dbtrk.id)
             except Exception, e:
                 #printerr(e)
                 print(e)
@@ -928,15 +814,21 @@ class JiraBackend(Backend):
                 # self.url = self.url + "&updated:after=" + last_mod_date
                 printdbg("Last bugs cached were modified at: %s" % self.last_mod_date)
 
-            bugs_number = self.bugsNumber(self.url)
+            bugs_number = self.bugsNumber(jira)
             print "Tickets to be retrieved:", str(bugs_number)
             remaining = bugs_number
             while (remaining > 0):
-                self.analyze_bug_list(issues_per_xml_query, bugs_number - remaining, bugsdb, dbtrk.id)
-                remaining -= issues_per_xml_query
+                startAtIssue = bugs_number-remaining
+                jira = JIRA(options_jira)
+                issuesAux = jira.search_issues('project=' + self.projectName + ' order by id asc',startAt=startAtIssue,maxResults=issues_per_query,fields=None)
+                issues=[]
+                for i in issuesAux:
+                    issues.append(jira.issue(i.key, expand='changelog'))
+                self.analyze_bug_list(issues, self.serverUrl+'/browse/', bugsdb, dbtrk.id)
+                remaining -= issues_per_query
                 #print "Remaining time: ", (remaining/issues_per_xml_query)*Config.delay/60, "m", "(",remaining,")"
                 time.sleep(self.delay)
 
             printout("Done. %s bugs analyzed" % (bugs_number))
 
-Backend.register_backend("jira", JiraBackend)
+Backend.register_backend("atljira", JiraBackend)
